@@ -114,6 +114,181 @@ def generate_grad_cam(model, input_tensor, target_class):
 
     return cam
 
+def segment_lesion(image):
+    # Convert to grayscale and apply thresholding
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Create a mask for GrabCut
+    mask = np.zeros(image.shape[:2], np.uint8)
+    mask[thresh == 255] = cv2.GC_FGD  # Foreground
+    mask[thresh == 0] = cv2.GC_BGD    # Background
+
+    # Initialize background and foreground models
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    # Apply GrabCut with the mask
+    cv2.grabCut(image, mask, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+
+    # Extract the segmented region
+    final_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+    segmented_image = image * final_mask[:, :, np.newaxis]
+
+    return segmented_image, final_mask
+
+def process_image(image_path):
+    # Load the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Error: Cannot load image at {image_path}. Check the file path or integrity.")
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Segment the lesion
+    segmented_image, final_mask = segment_lesion(image)
+
+    # Find contours
+    contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Find the image center
+    image_center = (image.shape[1] // 2, image.shape[0] // 2)  # (cx, cy)
+
+    # Initialize variables to store the closest contour
+    closest_contour = None
+    min_distance = float('inf')
+
+    # Iterate through all contours
+    for contour in contours:
+        # Calculate the centroid of the contour
+        moments = cv2.moments(contour)
+        if moments["m00"] != 0:  # Avoid division by zero
+            cx_contour = int(moments["m10"] / moments["m00"])
+            cy_contour = int(moments["m01"] / moments["m00"])
+            # Calculate distance to the image center
+            distance = np.sqrt((cx_contour - image_center[0]) ** 2 + (cy_contour - image_center[1]) ** 2)
+            # Update the closest contour if this distance is smaller
+            if distance < min_distance:
+                min_distance = distance
+                closest_contour = contour
+
+    # Proceed if we found a valid contour
+    if closest_contour is not None:
+        # Compute bounding box and metrics for the closest contour
+        x, y, w, h = cv2.boundingRect(closest_contour)
+        contour_area = cv2.contourArea(closest_contour)
+        bounding_area = w * h
+        irregularity = contour_area / bounding_area
+        perimeter = cv2.arcLength(closest_contour, True)
+        circularity = (4 * np.pi * contour_area) / (perimeter ** 2)
+
+        # Annotate the image
+        annotated_image = image_rgb.copy()
+        cv2.drawContours(annotated_image, [closest_contour], -1, (0, 255, 0), 2)  # Green contour
+        cv2.rectangle(annotated_image, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Red bounding box
+        font_scale = 0.5
+        font_thickness = 1
+        cv2.putText(annotated_image, f"Irregularity: {irregularity:.2f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+        cv2.putText(annotated_image, f"Circularity: {circularity:.2f}", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+
+        # Return processed data
+        return image_rgb, segmented_image, final_mask, annotated_image
+    else:
+        raise ValueError("No valid contour found near the center.")
+
+def analyze_symmetry_updated(image_path):
+    # Step 1: Process the image and find the largest contour
+    image_rgb, segmented_image, final_mask, _ = process_image(image_path)
+    contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Select the largest contour (instead of the closest)
+    if len(contours) == 0:
+        raise ValueError("No valid contours found.")
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Step 2: Perform PCA on the contour points to find the major axis
+    points = largest_contour[:, 0, :].astype(np.float32)
+    mean, eigenvectors = cv2.PCACompute(points, mean=None)
+    major_axis = eigenvectors[0]
+
+    # Step 3: Compute the rotation angle to align the major axis horizontally
+    angle = np.degrees(np.arctan2(major_axis[1], major_axis[0]))
+    rotation_matrix = cv2.getRotationMatrix2D(center=tuple(mean[0]), angle=-angle, scale=1.0)
+
+    # Step 4: Rotate the mask and the original image
+    h, w = final_mask.shape
+    rotated_mask = cv2.warpAffine(final_mask, rotation_matrix, (w, h), flags=cv2.INTER_NEAREST)
+    rotated_image = cv2.warpAffine(image_rgb, rotation_matrix, (image_rgb.shape[1], image_rgb.shape[0]))
+
+    # Step 5: Crop the rotated lesion region
+    contours_rotated, _ = cv2.findContours(rotated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours_rotated) == 0:
+        raise ValueError("No valid contours found after rotation.")
+    largest_rotated_contour = max(contours_rotated, key=cv2.contourArea)
+    x, y, w_box, h_box = cv2.boundingRect(largest_rotated_contour)
+    cropped_mask = rotated_mask[y:y+h_box, x:x+w_box]
+    cropped_lesion = rotated_image[y:y+h_box, x:x+w_box] * (cropped_mask[:, :, np.newaxis] > 0)
+
+    # Step 6: Split the lesion into left and right halves
+    mid_x = cropped_mask.shape[1] // 2
+    left_half = cropped_lesion[:, :mid_x]
+    right_half = cropped_lesion[:, mid_x:]
+    flipped_right_half = np.flip(right_half, axis=1)
+
+    # Step 7: Pad halves to match dimensions, then compute SSIM
+    min_rows = min(left_half.shape[0], flipped_right_half.shape[0])
+    max_cols = max(left_half.shape[1], flipped_right_half.shape[1])
+    padded_left = np.zeros((min_rows, max_cols, 3), dtype=left_half.dtype)
+    padded_right = np.zeros((min_rows, max_cols, 3), dtype=flipped_right_half.dtype)
+    padded_left[:left_half.shape[0], :left_half.shape[1], :] = left_half
+    padded_right[:flipped_right_half.shape[0], :flipped_right_half.shape[1], :] = flipped_right_half
+
+    ssim, _ = compare_ssim(padded_left, padded_right, full=True, multichannel=True, win_size=3)
+    return {"ssim_score": ssim}
+
+def analyze_border_and_circularity(image_path):
+    
+    # Step 1: Process the image and get the closest contour
+    image_rgb, segmented_image, final_mask, annotated_image = process_image(image_path)
+    contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Get the closest contour (already calculated in process_image)
+    closest_contour = None
+    image_center = (image_rgb.shape[1] // 2, image_rgb.shape[0] // 2)
+    min_distance = float('inf')
+
+    for contour in contours:
+        moments = cv2.moments(contour)
+        if moments["m00"] != 0:
+            cx_contour = int(moments["m10"] / moments["m00"])
+            cy_contour = int(moments["m01"] / moments["m00"])
+            distance = np.sqrt((cx_contour - image_center[0]) ** 2 + (cy_contour - image_center[1]) ** 2)
+            if distance < min_distance:
+                min_distance = distance
+                closest_contour = contour
+
+    if closest_contour is None:
+        raise ValueError("No valid contour found near the center.")
+
+    # Step 2: Calculate Border Irregularity and Circularity
+    x, y, w, h = cv2.boundingRect(closest_contour)
+    contour_area = cv2.contourArea(closest_contour)
+    bounding_box_area = w * h
+    perimeter = cv2.arcLength(closest_contour, True)
+
+    # Border Irregularity
+    border_irregularity = contour_area / bounding_box_area if bounding_box_area != 0 else 0
+
+    # Circularity
+    circularity = (4 * np.pi * contour_area) / (perimeter ** 2) if perimeter > 0 else 0
+
+    # Return metrics and visualizations
+    return {
+        "border_irregularity": border_irregularity,
+        "circularity": circularity,
+    }
+
 def visualize_grad_cam(image, grad_cam, save_path, title="Grad-CAM"):
     """
     Visualize Grad-CAM with the image and save the result.
@@ -195,6 +370,74 @@ def gradcam_single_image():
 
     except Exception as e:
         print(f"Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/analyze_symmetry', methods=['POST'])
+def analyze_symmetry():
+    try:
+        # Parse the JSON request to get the image URL
+        data = request.json
+        image_url = data.get('image_url')
+        if not image_url:
+            return jsonify({"error": "Image URL is required"}), 400
+
+        # Download the image
+        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            response = httpx.get(image_url)
+            if response.status_code == 200:
+                temp_file.write(response.content)
+            else:
+                return jsonify({"error": "Failed to download the image"}), 400
+
+            # Call the analyze_symmetry_updated function
+            result = analyze_symmetry_updated(temp_file.name)
+
+        # Extract the SSIM score
+        ssim_score = result['ssim_score']
+
+        # Build a descriptive message with a brief explanation
+        if ssim_score > 0.9:
+            explanation = "The lesion shows high symmetry, suggesting it is more likely benign."
+        elif 0.7 <= ssim_score <= 0.9:
+            explanation = "The lesion has moderate symmetry, which may require further investigation."
+        else:
+            explanation = "The lesion shows low symmetry, suggesting it could be malignant and warrants further evaluation."
+
+        response_message = (
+            f"The SSIM score is {ssim_score:.2f}. {explanation}"
+        )
+
+        return jsonify({"message": response_message})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/analyze_border_circularity', methods=['POST'])
+def analyze_border_circularity():
+    try:
+        data = request.json
+        image_url = data.get('image_url')
+        if not image_url:
+            return jsonify({"error": "Image URL is required"}), 400
+
+        # Download the image
+        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            response = httpx.get(image_url)
+            if response.status_code == 200:
+                temp_file.write(response.content)
+            else:
+                return jsonify({"error": "Failed to download the image"}), 400
+
+            # Perform border and circularity analysis
+            result = analyze_border_and_circularity(temp_file.name)
+
+        # Build a descriptive response
+        response_message = (
+            f"Border irregularity is {result['border_irregularity']:.2f} "
+            f"and circularity is {result['circularity']:.2f}."
+        )
+
+        return jsonify({"message": response_message})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
