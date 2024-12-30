@@ -7,6 +7,16 @@ from torch import flatten
 import torch.nn.functional as F
 from tempfile import NamedTemporaryFile
 import httpx
+from skimage.metrics import structural_similarity as compare_ssim
+import os
+import cv2
+import numpy as np
+from matplotlib import pyplot as plt
+import base64
+import cv2
+from io import BytesIO
+from PIL import Image
+import uuid
 
 class CNN(nn.Module):
     def __init__(self):
@@ -57,15 +67,88 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
+def get_cropped_lesion(image_path):
+    """
+    Extract the cropped lesion from the input image using segmentation and contour logic.
+
+    Args:
+        image_path (str): Path to the input image.
+
+    Returns:
+        PIL.Image: The cropped lesion as a PIL Image.
+    """
+    # Load the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Error: Cannot load image at {image_path}. Check the file path or integrity.")
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Use your `segment_lesion` function to segment the lesion
+    segmented_image, final_mask = segment_lesion(image)
+
+    # Find contours
+    contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Find the image center
+    image_center = (image.shape[1] // 2, image.shape[0] // 2)  # (cx, cy)
+
+    # Find the closest contour
+    closest_contour = None
+    min_distance = float('inf')
+    for contour in contours:
+        moments = cv2.moments(contour)
+        if moments["m00"] != 0:  # Avoid division by zero
+            cx_contour = int(moments["m10"] / moments["m00"])
+            cy_contour = int(moments["m01"] / moments["m00"])
+            distance = np.sqrt((cx_contour - image_center[0]) ** 2 + (cy_contour - image_center[1]) ** 2)
+            if distance < min_distance:
+                min_distance = distance
+                closest_contour = contour
+
+    if closest_contour is None:
+        raise ValueError("No valid contour found near the center.")
+
+    # Extract the bounding box of the closest contour
+    x, y, w, h = cv2.boundingRect(closest_contour)
+
+    # Create a mask for the contour
+    mask = np.zeros_like(final_mask)
+    cv2.drawContours(mask, [closest_contour], -1, 255, thickness=cv2.FILLED)
+
+    # Crop the lesion from the image
+    cropped_mask = mask[y:y+h, x:x+w]
+    cropped_lesion = image_rgb[y:y+h, x:x+w] * (cropped_mask[:, :, np.newaxis] > 0)
+
+    # Convert the cropped lesion to a PIL image
+    cropped_lesion_pil = Image.fromarray(cropped_lesion.astype('uint8'))
+
+    return cropped_lesion_pil
+
 def predict_single_image(image_path):
-    image = Image.open(image_path).convert("RGB")
-    input_tensor = transform(image).unsqueeze(0)
+    """
+    Predict whether the input image contains a malignant or benign lesion.
+
+    Args:
+        image_path (str): Path to the input image.
+
+    Returns:
+        tuple: The predicted label ("Malignant" or "Benign") and the confidence score.
+    """
+    # Step 1: Crop the lesion from the image
+    cropped_lesion = get_cropped_lesion(image_path)
+
+    # Step 2: Apply transformations and prepare input tensor
+    input_tensor = transform(cropped_lesion).unsqueeze(0)  # Transform the cropped lesion
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     input_tensor = input_tensor.to(device)
+
+    # Step 3: Perform prediction using the model
     with torch.no_grad():
         output = model(input_tensor)
         prediction = torch.sigmoid(output).cpu().item()
+
+    # Step 4: Determine the label based on the prediction score
     label = "Malignant" if prediction > 0.5 else "Benign"
     return label, prediction
 
@@ -413,6 +496,7 @@ def analyze_symmetry():
 
 @app.route('/analyze_border_circularity', methods=['POST'])
 def analyze_border_circularity():
+    
     try:
         data = request.json
         image_url = data.get('image_url')
