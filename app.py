@@ -155,6 +155,14 @@ def predict_single_image(image_path):
 def generate_grad_cam(model, input_tensor, target_class):
     model.eval()  # Set the model to evaluation mode
 
+    # Step 1: Get cropped lesion
+    cropped_lesion = get_cropped_lesion(image_path)
+
+    # Step 2: Preprocess the cropped lesion
+    input_tensor = transform(cropped_lesion).unsqueeze(0)  # Apply transformations
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    input_tensor = input_tensor.to(device)
+
     # Hook the gradients of the last convolutional layer
     gradients = []
     activations = []
