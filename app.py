@@ -67,24 +67,27 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-def get_cropped_lesion(image_path):
+def get_cropped_lesion(image):
     """
     Extract the cropped lesion from the input image using segmentation and contour logic.
 
     Args:
-        image_path (str): Path to the input image.
+        image (np.ndarray): Input image as a NumPy array.
 
     Returns:
         PIL.Image: The cropped lesion as a PIL Image.
     """
-    # Load the image
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Error: Cannot load image at {image_path}. Check the file path or integrity.")
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if not isinstance(image, np.ndarray):
+        raise ValueError("Input image must be a NumPy array.")
+
+    # Convert to RGB if the input is not already in RGB format
+    if len(image.shape) == 2 or image.shape[2] != 3:  # Grayscale or other format
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    else:
+        image_rgb = image
 
     # Use your `segment_lesion` function to segment the lesion
-    segmented_image, final_mask = segment_lesion(image)
+    segmented_image, final_mask = segment_lesion(image_rgb)
 
     # Find contours
     contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -116,31 +119,30 @@ def get_cropped_lesion(image_path):
     cv2.drawContours(mask, [closest_contour], -1, 255, thickness=cv2.FILLED)
 
     # Crop the lesion from the image
-    cropped_mask = mask[y:y+h, x:x+w]
-    cropped_lesion = image_rgb[y:y+h, x:x+w] * (cropped_mask[:, :, np.newaxis] > 0)
+    cropped_mask = mask[y:y + h, x:x + w]
+    cropped_lesion = image_rgb[y:y + h, x:x + w] * (cropped_mask[:, :, np.newaxis] > 0)
 
     # Convert the cropped lesion to a PIL image
     cropped_lesion_pil = Image.fromarray(cropped_lesion.astype('uint8'))
 
     return cropped_lesion_pil
 
-def predict_single_image(image_path):
+def predict_single_image(image):
     """
     Predict whether the input image contains a malignant or benign lesion.
 
     Args:
-        image_path (str): Path to the input image.
+        image (np.ndarray): Input image as a NumPy array.
 
     Returns:
         tuple: The predicted label ("Malignant" or "Benign") and the confidence score.
     """
     # Step 1: Crop the lesion from the image
-    cropped_lesion = get_cropped_lesion(image_path)
+    cropped_lesion = get_cropped_lesion(image)
 
     # Step 2: Apply transformations and prepare input tensor
     input_tensor = transform(cropped_lesion).unsqueeze(0)  # Transform the cropped lesion
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
     input_tensor = input_tensor.to(device)
 
     # Step 3: Perform prediction using the model
@@ -154,14 +156,6 @@ def predict_single_image(image_path):
 
 def generate_grad_cam(model, input_tensor, target_class):
     model.eval()  # Set the model to evaluation mode
-
-    # Step 1: Get cropped lesion
-    cropped_lesion = get_cropped_lesion(image_path)
-
-    # Step 2: Preprocess the cropped lesion
-    input_tensor = transform(cropped_lesion).unsqueeze(0)  # Apply transformations
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_tensor = input_tensor.to(device)
 
     # Hook the gradients of the last convolutional layer
     gradients = []
@@ -429,14 +423,13 @@ def gradcam_single_image():
     try:
         data = request.json
         image_url = data.get('image_url')
-        target_class = data.get('target_class', 0)  # Default to class 0
 
         if not image_url:
             return jsonify({"error": "Image URL is required"}), 400
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Download the image
+        # Step 1: Download the image
         with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
             response = httpx.get(image_url)
             if response.status_code == 200:
@@ -445,18 +438,25 @@ def gradcam_single_image():
                 print(f"HTTP Error: {response.status_code}, Content: {response.content}")
                 return jsonify({"error": "Failed to download the image"}), 400
 
-            # Open and preprocess the image
-            image = Image.open(temp_file.name).convert("RGB")
-            input_tensor = transform(image).unsqueeze(0).to(device)
+            # Step 2: Extract cropped lesion
+            cropped_lesion = get_cropped_lesion(temp_file.name)
 
-            # Generate Grad-CAM
+            # Step 3: Preprocess the cropped lesion
+            input_tensor = transform(cropped_lesion).unsqueeze(0).to(device)
+
+            # Step 4: Predict the target class using the model
+            with torch.no_grad():
+                output = model(input_tensor)
+                target_class = torch.argmax(output, dim=1).item()  # Get the predicted class index
+
+            # Step 5: Generate Grad-CAM
             grad_cam = generate_grad_cam(model, input_tensor, target_class)
 
-            # Save Grad-CAM visualization
+            # Step 6: Save Grad-CAM visualization
             save_path = temp_file.name.replace(".jpg", "_gradcam.jpg")
-            visualize_grad_cam(transform(image).squeeze().cpu(), grad_cam, save_path)
+            visualize_grad_cam(transform(cropped_lesion).squeeze().cpu(), grad_cam, save_path)
 
-            # Return the file path for download or further use
+            # Step 7: Return the saved Grad-CAM image
             return send_file(save_path, mimetype='image/jpeg')
 
     except Exception as e:
