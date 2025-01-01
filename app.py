@@ -21,7 +21,7 @@ from flask import send_file
 from skimage import filters
 from skimage.color import rgb2gray
 import base64
-
+from captum.attr import Saliency
 
 class CNN(nn.Module):
     def __init__(self):
@@ -469,6 +469,37 @@ def detect_pigmentation(image_path):
     return heatmap_path, edge_overlay_path
 
 
+def generate_saliency(input_tensor, target_class):
+    """
+    Generate a saliency map for the global model and input tensor.
+
+    Args:
+        input_tensor (torch.Tensor): The input tensor with shape (1, 3, H, W).
+        target_class (int): The target class index for which to compute saliency.
+
+    Returns:
+        numpy.ndarray: The saliency map (2D array normalized to [0, 1]).
+    """
+    global model
+    model.eval()
+
+    # Use Captum's Saliency to compute attributions
+    saliency = Saliency(model)
+
+    # Compute saliency attributions for the target class
+    attributions = saliency.attribute(input_tensor, target=target_class)
+    saliency_map = attributions.cpu().detach().numpy().squeeze()
+
+    # If shape is (3, H, W), take the max across channels
+    if saliency_map.ndim == 3:  
+        saliency_map = np.max(np.abs(saliency_map), axis=0)
+
+    # Normalize to [0, 1]
+    min_val, max_val = saliency_map.min(), saliency_map.max()
+    saliency_map = (saliency_map - min_val) / (max_val - min_val + 1e-8)
+
+    return saliency_map
+
 @app.route('/analyze', methods=['POST'])
 def analyze_image():
     try:
@@ -666,6 +697,69 @@ def analyze_border_circularity_route():
         })
 
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/saliency', methods=['POST'])
+def saliency_single_image():
+    try:
+        data = request.json
+        image_url = data.get('image_url')
+
+        if not image_url:
+            return jsonify({"error": "Image URL is required"}), 400
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 1. Download the image
+        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            response = httpx.get(image_url)
+            if response.status_code == 200:
+                temp_file.write(response.content)
+            else:
+                return jsonify({"error": "Failed to download the image"}), 400
+
+        # 2. Read the image as NumPy array
+        image = cv2.imread(temp_file.name)
+        if image is None:
+            return jsonify({"error": "Failed to load image into NumPy array"}), 400
+
+        # 3. Extract cropped lesion
+        cropped_lesion = get_cropped_lesion(image)
+
+        # 4. Preprocess the cropped lesion
+        input_tensor = transform(cropped_lesion).unsqueeze(0).to(device)
+
+        # 5. Predict the target class using the model
+        with torch.no_grad():
+            output = model(input_tensor)
+            target_class = torch.argmax(output, dim=1).item()
+
+        # 6. Generate Saliency Map
+        saliency_map = generate_saliency(input_tensor, target_class)
+
+        # --- If the map is all zeros or ones, you may see very small file sizes.
+        #     Adding a color map can help visualize differences better. ---
+
+        # Convert saliency [0..1 float] -> 8-bit image
+        saliency_map_8u = (saliency_map * 255).astype(np.uint8)
+
+        # Optional: Apply a color map for better visual interpretability
+        saliency_map_color = cv2.applyColorMap(saliency_map_8u, cv2.COLORMAP_HOT)
+
+        # 7. Encode Saliency Map to JPEG (using the color version here)
+        success, buffer = cv2.imencode('.jpg', saliency_map_color)
+        if not success:
+            return jsonify({"error": "Failed to encode saliency map to JPEG"}), 500
+
+        # 8. Convert to Base64
+        saliency_jpeg_b64 = base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({
+            "saliency_image": f"data:image/jpeg;base64,{saliency_jpeg_b64}"
+        })
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
