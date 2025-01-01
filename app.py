@@ -662,7 +662,7 @@ def analyze_border_circularity_route():
         return jsonify({
             "border_irregularity": border_irregularity,
             "circularity": circularity,
-            "annotated_image_base64": base64_image
+            "annotated_image_base64": f"data:image/jpeg;base64,{base64_image}"
         })
 
     except Exception as e:
