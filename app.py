@@ -18,6 +18,10 @@ from io import BytesIO
 from PIL import Image
 import uuid
 from flask import send_file
+from skimage import filters
+from skimage.color import rgb2gray
+import base64
+
 
 class CNN(nn.Module):
     def __init__(self):
@@ -199,7 +203,27 @@ def generate_grad_cam(model, input_tensor, target_class):
     backward_handle.remove()
 
     return cam
+def remove_hair_improved(image):
+    """
+    Hair removal method with reduced blurriness.
+    :param image: Input image in BGR format
+    :return: Image with hair removed and less blurriness
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # Apply a BlackHat filter to detect hair
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))  # Smaller kernel size for finer hair detection
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+
+    # Threshold the blackhat result to create a mask of hair
+    _, mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+
+    # Inpaint the image to remove the hair with a smaller inpainting radius
+    inpainted_image = cv2.inpaint(image, mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
+
+    return inpainted_image
+    
 def segment_lesion(image):
     # Convert to grayscale and apply thresholding
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -412,6 +436,49 @@ def visualize_grad_cam(image, grad_cam, save_path, title="Grad-CAM"):
 
     return save_path
 
+def detect_pigmentation(image_path):
+    # Load the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError("Error: Cannot load image. Please check the image path.")
+
+    # Step 1: Extract the cropped lesion
+    cropped_lesion = get_cropped_lesion(image)
+
+    # Step 2: Convert to NumPy array
+    cropped_lesion_np = np.array(cropped_lesion)
+
+    # Step 3: Grayscale conversion
+    gray = cv2.cvtColor(cropped_lesion_np, cv2.COLOR_RGB2GRAY)
+
+    # Step 4: Gaussian Blur
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Step 5: Thresholding
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Step 6: Generate heatmap
+    heatmap = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    # Step 7: Detect edges
+    edges = filters.sobel(rgb2gray(cropped_lesion_np))
+    edge_overlay = cropped_lesion_np.copy()
+    edge_overlay[edges > 0.1] = [255, 0, 0]
+
+    # Save results
+    results_dir = "pigmentation_results"
+    os.makedirs(results_dir, exist_ok=True)
+
+    heatmap_path = os.path.join(results_dir, f"heatmap_{uuid.uuid4().hex}.jpg")
+    edge_overlay_path = os.path.join(results_dir, f"edge_overlay_{uuid.uuid4().hex}.jpg")
+
+    # Validate outputs before saving
+    cv2.imwrite(heatmap_path, heatmap)
+    cv2.imwrite(edge_overlay_path, cv2.cvtColor(edge_overlay.astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+    return heatmap_path, edge_overlay_path
+
 
 @app.route('/analyze', methods=['POST'])
 def analyze_image():
@@ -490,6 +557,38 @@ def gradcam_single_image():
         print(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/detect_pigmentation', methods=['POST'])
+def detect_pigmentation_route():
+    try:
+        # Parse the JSON request to get the image URL
+        data = request.json
+        image_url = data.get('image_url')
+        if not image_url:
+            return jsonify({"error": "Image URL is required"}), 400
+
+        # Download the image
+        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            response = httpx.get(image_url, follow_redirects=True)
+            if response.status_code == 200:
+                temp_file.write(response.content)
+            else:
+                return jsonify({"error": f"Failed to download the image. HTTP Status: {response.status_code}"}), 400
+
+            # Perform pigmentation detection
+            heatmap_path, edge_overlay_path = detect_pigmentation(temp_file.name)
+
+        # Return the heatmap as a downloadable file
+        return send_file(
+            heatmap_path,
+            mimetype='image/jpeg',
+            as_attachment=True,
+            download_name="heatmap.jpg"
+        )
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/analyze_symmetry', methods=['POST'])
 def analyze_symmetry():
     try:
@@ -529,6 +628,7 @@ def analyze_symmetry():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/analyze_border_circularity', methods=['POST'])
 def analyze_border_circularity_route():
     try:
@@ -538,7 +638,7 @@ def analyze_border_circularity_route():
         if not image_url:
             return jsonify({"error": "Image URL is required"}), 400
 
-        # Download the image
+        # Step 1: Download the image
         with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
             response = httpx.get(image_url)
             if response.status_code == 200:
@@ -546,21 +646,35 @@ def analyze_border_circularity_route():
             else:
                 return jsonify({"error": "Failed to download the image"}), 400
 
-            # Perform border and circularity analysis
-            result = analyze_border_and_circularity(temp_file.name)
+            # Load the image and apply hair removal
+            image = cv2.imread(temp_file.name)
+            if image is None:
+                return jsonify({"error": "Failed to load image"}), 400
 
-        # Save the annotated image path and send it as a response
-        annotated_image_path = result["annotated_file_path"]
+            hair_removed_image = remove_hair_improved(image)
+
+            # Save the hair-removed image to a temporary path
+            hair_removed_path = temp_file.name.replace(".jpg", "_hair_removed.jpg")
+            cv2.imwrite(hair_removed_path, hair_removed_image)
+
+        # Step 2: Pass the hair-removed image path to analyze_border_and_circularity
+        result = analyze_border_and_circularity(hair_removed_path)
+
+        # Extract metrics
         border_irregularity = result["border_irregularity"]
         circularity = result["circularity"]
 
-        # Response with the saved image and metrics
-        return send_file(
-            annotated_image_path,
-            mimetype="image/jpeg",
-            as_attachment=True,
-            download_name="annotated_image.jpg"
-        ), 200
+        # Load the annotated image and encode it in Base64
+        annotated_image_path = result["annotated_file_path"]
+        with open(annotated_image_path, "rb") as img_file:
+            base64_image = base64.b64encode(img_file.read()).decode('utf-8')
+
+        # Return metrics and the image as Base64
+        return jsonify({
+            "border_irregularity": border_irregularity,
+            "circularity": circularity,
+            "annotated_image_base64": base64_image
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
