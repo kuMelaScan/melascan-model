@@ -17,6 +17,7 @@ import cv2
 from io import BytesIO
 from PIL import Image
 import uuid
+from flask import send_file
 
 class CNN(nn.Module):
     def __init__(self):
@@ -333,12 +334,11 @@ def analyze_symmetry_updated(image_path):
     return {"ssim_score": ssim}
 
 def analyze_border_and_circularity(image_path):
-    
     # Step 1: Process the image and get the closest contour
     image_rgb, segmented_image, final_mask, annotated_image = process_image(image_path)
     contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Get the closest contour (already calculated in process_image)
+    # Get the closest contour
     closest_contour = None
     image_center = (image_rgb.shape[1] // 2, image_rgb.shape[0] // 2)
     min_distance = float('inf')
@@ -368,10 +368,28 @@ def analyze_border_and_circularity(image_path):
     # Circularity
     circularity = (4 * np.pi * contour_area) / (perimeter ** 2) if perimeter > 0 else 0
 
-    # Return metrics and visualizations
+    # Step 3: Annotate the image with results
+    cv2.drawContours(annotated_image, [closest_contour], -1, (0, 255, 0), 2)  # Green contour
+    cv2.rectangle(annotated_image, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Red bounding box
+
+    font_scale = 0.5
+    font_thickness = 1
+    cv2.putText(annotated_image, f"Irregularity: {border_irregularity:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+    cv2.putText(annotated_image, f"Circularity: {circularity:.2f}", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+
+    # Step 4: Save the annotated image
+    annotated_dir = "annotated_results"
+    os.makedirs(annotated_dir, exist_ok=True)
+    annotated_file_path = os.path.join(annotated_dir, f"annotated_{uuid.uuid4().hex}.jpg")
+    cv2.imwrite(annotated_file_path, cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR))
+
+    # Step 5: Return metrics and the annotated image path
     return {
         "border_irregularity": border_irregularity,
         "circularity": circularity,
+        "annotated_file_path": annotated_file_path  # Include the saved file path
     }
 
 def visualize_grad_cam(image, grad_cam, save_path, title="Grad-CAM"):
@@ -405,14 +423,19 @@ def analyze_image():
 
         # Download the image
         with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            response = httpx.get(image_url)
+            response = httpx.get(image_url, follow_redirects=True)
             if response.status_code == 200:
                 temp_file.write(response.content)
+                temp_file.close()  # Ensure the file is saved before reading it
+                # Read the image as a NumPy array
+                image = cv2.imread(temp_file.name)
+                if image is None:
+                    return jsonify({"error": "Failed to load image into NumPy array"}), 400
             else:
                 return jsonify({"error": "Failed to download the image"}), 400
 
             # Perform prediction
-            label, confidence = predict_single_image(temp_file.name)
+            label, confidence = predict_single_image(image)
 
         return jsonify({"label": label, "confidence": confidence})
     except Exception as e:
@@ -438,25 +461,29 @@ def gradcam_single_image():
                 print(f"HTTP Error: {response.status_code}, Content: {response.content}")
                 return jsonify({"error": "Failed to download the image"}), 400
 
-            # Step 2: Extract cropped lesion
-            cropped_lesion = get_cropped_lesion(temp_file.name)
+            image = cv2.imread(temp_file.name)
+            if image is None:
+                return jsonify({"error": "Failed to load image into NumPy array"}), 400
 
-            # Step 3: Preprocess the cropped lesion
+            # Step 3: Extract cropped lesion
+            cropped_lesion = get_cropped_lesion(image)
+
+            # Step 4: Preprocess the cropped lesion
             input_tensor = transform(cropped_lesion).unsqueeze(0).to(device)
 
-            # Step 4: Predict the target class using the model
+            # Step 5: Predict the target class using the model
             with torch.no_grad():
                 output = model(input_tensor)
                 target_class = torch.argmax(output, dim=1).item()  # Get the predicted class index
 
-            # Step 5: Generate Grad-CAM
+            # Step 6: Generate Grad-CAM
             grad_cam = generate_grad_cam(model, input_tensor, target_class)
 
-            # Step 6: Save Grad-CAM visualization
+            # Step 7: Save Grad-CAM visualization
             save_path = temp_file.name.replace(".jpg", "_gradcam.jpg")
             visualize_grad_cam(transform(cropped_lesion).squeeze().cpu(), grad_cam, save_path)
 
-            # Step 7: Return the saved Grad-CAM image
+            # Step 8: Return the saved Grad-CAM image
             return send_file(save_path, mimetype='image/jpeg')
 
     except Exception as e:
@@ -503,9 +530,9 @@ def analyze_symmetry():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/analyze_border_circularity', methods=['POST'])
-def analyze_border_circularity():
-    
+def analyze_border_circularity_route():
     try:
+        # Parse the JSON request to get the image URL
         data = request.json
         image_url = data.get('image_url')
         if not image_url:
@@ -522,13 +549,19 @@ def analyze_border_circularity():
             # Perform border and circularity analysis
             result = analyze_border_and_circularity(temp_file.name)
 
-        # Build a descriptive response
-        response_message = (
-            f"Border irregularity is {result['border_irregularity']:.2f} "
-            f"and circularity is {result['circularity']:.2f}."
-        )
+        # Save the annotated image path and send it as a response
+        annotated_image_path = result["annotated_file_path"]
+        border_irregularity = result["border_irregularity"]
+        circularity = result["circularity"]
 
-        return jsonify({"message": response_message})
+        # Response with the saved image and metrics
+        return send_file(
+            annotated_image_path,
+            mimetype="image/jpeg",
+            as_attachment=True,
+            download_name="annotated_image.jpg"
+        ), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
