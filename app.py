@@ -133,29 +133,18 @@ def get_cropped_lesion(image):
     return cropped_lesion_pil
 
 def predict_single_image(image):
-    """
-    Predict whether the input image contains a malignant or benign lesion.
-
-    Args:
-        image (np.ndarray): Input image as a NumPy array.
-
-    Returns:
-        tuple: The predicted label ("Malignant" or "Benign") and the confidence score.
-    """
-    # Step 1: Crop the lesion from the image
-    cropped_lesion = get_cropped_lesion(image)
-
-    # Step 2: Apply transformations and prepare input tensor
-    input_tensor = transform(cropped_lesion).unsqueeze(0)  # Transform the cropped lesion
+    
+    # Step 1: Apply transformations and prepare input tensor
+    input_tensor = transform(Image.fromarray(image)).unsqueeze(0)  # Transform the full image
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     input_tensor = input_tensor.to(device)
 
-    # Step 3: Perform prediction using the model
+    # Step 2: Perform prediction using the model
     with torch.no_grad():
         output = model(input_tensor)
         prediction = torch.sigmoid(output).cpu().item()
 
-    # Step 4: Determine the label based on the prediction score
+    # Step 3: Determine the label based on the prediction score
     label = "Malignant" if prediction > 0.5 else "Benign"
     return label, prediction
 
