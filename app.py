@@ -23,46 +23,63 @@ from skimage.color import rgb2gray
 import base64
 from captum.attr import Saliency
 
-class CNN(nn.Module):
+class DeeperCNN(nn.Module):
     def __init__(self):
-        super(CNN, self).__init__()
+        super(DeeperCNN, self).__init__()
 
-        # Convolutional Layers
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1)
+        # Block 1
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(0.25)
+        )
 
-        # Batch Normalization Layers
-        self.bn1 = nn.BatchNorm2d(16)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.bn3 = nn.BatchNorm2d(64)
+        # Block 2
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(0.25)
+        )
 
-        # Pooling Layer
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        # Block 3
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(0.25)
+        )
 
-        # Fully Connected Layers
-        self.fc1 = nn.Linear(64 * 28 * 28, 1024)  # Adjust size based on image input size (224x224)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, 1)  # Output layer for binary classification
+        # After block3, the spatial size is 224 -> 112 -> 56 -> 28
+        # so the feature map is (128, 28, 28) = 128 * 28 * 28
+        self.fc1 = nn.Linear(128 * 28 * 28, 512)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(512, 1)  # single output for BCEWithLogitsLoss
 
-        # Dropout layer for regularization
-        self.drop = nn.Dropout(p=0.5)
-
-    def forward(self, x: torch.Tensor):
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))
-        x = flatten(x, 1)
-        x = F.relu(self.fc1(x))
-        x = self.drop(x)
-        x = F.relu(self.fc2(x))
-        x = self.drop(x)
-        x = self.fc3(x)
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = x.view(x.size(0), -1)   # Flatten
+        x = nn.functional.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)            # No sigmoid here
         return x
+        
+print(torch.__version__)
 app = Flask(__name__)
 
+model = DeeperCNN()
 # Model loading
-model = torch.load("cnn_model_full.pth")
+state_dict = torch.load("new_saved_model.pth", map_location=torch.device('cpu'))
+model.load_state_dict(state_dict)
 model.eval()
 
 # Transformations
@@ -132,22 +149,44 @@ def get_cropped_lesion(image):
 
     return cropped_lesion_pil
 
-def predict_single_image(image):
-    
-    # Step 1: Apply transformations and prepare input tensor
-    input_tensor = transform(Image.fromarray(image)).unsqueeze(0)  # Transform the full image
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_tensor = input_tensor.to(device)
+def preprocess_image(image_path, transform):
+    """
+    Load and preprocess the image for the model.
+    """
+    # Open the image in RGB format
+    image = Image.open(image_path).convert('RGB')
+
+    # Apply transformations
+    input_tensor = transform(image).unsqueeze(0)
+    return input_tensor
+
+def predict_single_image(image, transform, device):
+    """
+    Predict the label and confidence for a single image.
+
+    Args:
+        image (PIL.Image): The input image as a PIL image object.
+        transform: The image transformation pipeline.
+        device: The device ('cpu' or 'cuda') to use for model inference.
+
+    Returns:
+        tuple: (label, confidence) where label is "Malignant" or "Benign",
+               and confidence is the probability score.
+    """
+    # Step 1: Apply transformations
+    input_tensor = transform(image).unsqueeze(0).to(device)
 
     # Step 2: Perform prediction using the model
     with torch.no_grad():
-        output = model(input_tensor)
-        prediction = torch.sigmoid(output).cpu().item()
+        logits = model(input_tensor)  # Raw logits
+        print(f"Raw model output (logits): {logits}")
+        prediction = torch.sigmoid(logits).cpu().item()  # Convert logits to probability
+        print(f"Probability after sigmoid: {prediction}")
 
     # Step 3: Determine the label based on the prediction score
     label = "Malignant" if prediction > 0.5 else "Benign"
     return label, prediction
-
+    
 def generate_grad_cam(model, input_tensor, target_class):
     model.eval()  # Set the model to evaluation mode
 
@@ -503,6 +542,7 @@ def generate_saliency(input_tensor, target_class):
 @app.route('/analyze', methods=['POST'])
 def analyze_image():
     try:
+        # Parse the JSON request to get the image URL
         data = request.json
         image_url = data.get('image_url')
         if not image_url:
@@ -514,15 +554,15 @@ def analyze_image():
             if response.status_code == 200:
                 temp_file.write(response.content)
                 temp_file.close()  # Ensure the file is saved before reading it
-                # Read the image as a NumPy array
-                image = cv2.imread(temp_file.name)
-                if image is None:
-                    return jsonify({"error": "Failed to load image into NumPy array"}), 400
+
+                # Read the image using PIL (same as Colab)
+                image = Image.open(temp_file.name).convert('RGB')
             else:
                 return jsonify({"error": "Failed to download the image"}), 400
 
-            # Perform prediction
-            label, confidence = predict_single_image(image)
+        # Perform prediction using the predict_single_image function
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        label, confidence = predict_single_image(image, transform, device)
 
         return jsonify({"label": label, "confidence": confidence})
     except Exception as e:
@@ -552,8 +592,10 @@ def gradcam_single_image():
             if image is None:
                 return jsonify({"error": "Failed to load image into NumPy array"}), 400
 
+            image1 = remove_hair_improved(image)
+
             # Step 3: Extract cropped lesion
-            cropped_lesion = get_cropped_lesion(image)
+            cropped_lesion = get_cropped_lesion(image1)
 
             # Step 4: Preprocess the cropped lesion
             input_tensor = transform(cropped_lesion).unsqueeze(0).to(device)
